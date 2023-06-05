@@ -1,6 +1,10 @@
-use std::io::{BufReader, BufWriter};
+use std::{
+    io::{BufReader, BufWriter},
+    sync::mpsc::{self, Receiver},
+};
 
 use anyhow::Context;
+use clap::Parser;
 use google_drive3::{
     hyper::{self, client::HttpConnector},
     hyper_rustls::{HttpsConnector, HttpsConnectorBuilder},
@@ -14,51 +18,21 @@ use serde_with::{serde_as, DisplayFromStr};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_logger()?;
+    let args = Args::parse();
     let drive = init_drive().await?;
     let ctrlc_handler = init_ctrlc()?;
 
-    let mut list = restore_data()?;
-    loop {
-        let token = match list.last() {
-            None => "",
-            Some(last) => match &last.next_page_token {
-                None => {
-                    save_data(&list)?;
-                    info!("Complete.");
-                    break;
-                }
-                Some(ref token) => token,
-            },
-        };
-        info!("Page {}", list.len());
-        let Ok(res) = drive
-            .files()
-            .list()
-            // Includes all owned files plus shared roots (not shared children)?
-            .corpora("user") // "user" by default, but setting it explicitly
-            .q("'me' in owners")
-            .page_token(token)
-            .param("fields", "nextPageToken,files(id,mimeType,parents,name,size,quotaBytesUsed,sha256Checksum)")
-            .doit()
-            .await else {
-            error!("Aborting due to an API error.");
-            break save_data(&list)?
-        };
-        let Ok(res) = FileList::try_from(res.1) else {
-            error!("Aborting due to a conversion error.");
-            break save_data(&list)?
-        };
-        list.push(res);
-        if let Ok(()) = ctrlc_handler.try_recv() {
-            info!("Received ctrl-c.  Saving before terminating.");
-            save_data(&list)?;
-            break;
-        }
-        if list.len() % 10 == 0 {
-            save_data(&list)?;
-        }
+    if args.list {
+        list_files(&drive, &ctrlc_handler).await?;
     }
+
     Ok(())
+}
+
+#[derive(Parser)]
+struct Args {
+    #[clap(long)]
+    list: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -81,7 +55,7 @@ struct File {
     quota_bytes_used: Option<u64>,
     #[serde_as(as = "Option<DisplayFromStr>")]
     size: Option<u64>,
-    #[serde(rename="sha256Checksum")]
+    #[serde(rename = "sha256Checksum")]
     sha256_checksum: Option<String>,
 }
 fn null_to_default<'de, D, T>(d: D) -> Result<T, D::Error>
@@ -118,8 +92,8 @@ fn init_logger() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn init_ctrlc() -> anyhow::Result<std::sync::mpsc::Receiver<()>> {
-    let (sender, receiver) = std::sync::mpsc::channel();
+fn init_ctrlc() -> anyhow::Result<mpsc::Receiver<()>> {
+    let (sender, receiver) = mpsc::channel();
     ctrlc::set_handler(move || {
         warn!("Ctrl-C detected!");
         if let Err(e) = sender.send(()) {
@@ -129,7 +103,8 @@ fn init_ctrlc() -> anyhow::Result<std::sync::mpsc::Receiver<()>> {
     Ok(receiver)
 }
 
-async fn init_drive() -> anyhow::Result<DriveHub<HttpsConnector<HttpConnector>>> {
+type Drive = DriveHub<HttpsConnector<HttpConnector>>;
+async fn init_drive() -> anyhow::Result<Drive> {
     let hyper = hyper::Client::builder().build(
         HttpsConnectorBuilder::new()
             .with_native_roots()
@@ -172,4 +147,49 @@ fn save_data(list: &[FileList]) -> anyhow::Result<()> {
     .context(
         "Unfortunately, we failed to save data and the accumulated data was permanently losed.",
     )
+}
+
+async fn list_files(drive: &Drive, ctrlc_handler: &mpsc::Receiver<()>) -> anyhow::Result<()> {
+    let mut list = restore_data()?;
+    loop {
+        let token = match list.last() {
+            None => "",
+            Some(last) => match &last.next_page_token {
+                None => {
+                    save_data(&list)?;
+                    info!("Complete.");
+                    break;
+                }
+                Some(ref token) => token,
+            },
+        };
+        info!("Page {}", list.len());
+        let Ok(res) = drive
+            .files()
+            .list()
+            // Includes all owned files plus shared roots (not shared children)?
+            .corpora("user") // "user" by default, but setting it explicitly
+            .q("'me' in owners")
+            .page_token(token)
+            .param("fields", "nextPageToken,files(id,mimeType,parents,name,size,quotaBytesUsed,sha256Checksum)")
+            .doit()
+            .await else {
+            error!("Aborting due to an API error.");
+            break save_data(&list)?
+        };
+        let Ok(res) = FileList::try_from(res.1) else {
+            error!("Aborting due to a conversion error.");
+            break save_data(&list)?
+        };
+        list.push(res);
+        if let Ok(()) = ctrlc_handler.try_recv() {
+            info!("Received ctrl-c.  Saving before terminating.");
+            save_data(&list)?;
+            break;
+        }
+        if list.len() % 10 == 0 {
+            save_data(&list)?;
+        }
+    }
+    Ok(())
 }
