@@ -9,6 +9,7 @@ use google_drive3::{
 };
 use log::{error, info, warn};
 use serde::{Deserialize, Deserializer, Serialize};
+use serde_with::{serde_as, DisplayFromStr};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -37,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
             .corpora("user") // "user" by default, but setting it explicitly
             .q("'me' in owners")
             .page_token(token)
-            .param("fields", "nextPageToken,files(id,mimeType,parents,name)")
+            .param("fields", "nextPageToken,files(id,mimeType,parents,name,size,quotaBytesUsed)")
             .doit()
             .await else {
             error!("Aborting due to an API error.");
@@ -66,6 +67,7 @@ struct FileList {
     #[serde(rename = "nextPageToken")]
     next_page_token: Option<String>,
 }
+#[serde_as]
 #[derive(Serialize, Deserialize)]
 struct File {
     id: String,
@@ -74,6 +76,11 @@ struct File {
     #[serde(deserialize_with = "null_to_default")]
     parents: Vec<String>,
     name: String,
+    #[serde(rename = "quotaBytesUsed")]
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    quota_bytes_used: Option<u64>,
+    #[serde_as(as = "Option<DisplayFromStr>")]
+    size: Option<u64>,
 }
 fn null_to_default<'de, D, T>(d: D) -> Result<T, D::Error>
 where
@@ -146,7 +153,7 @@ fn restore_data() -> anyhow::Result<Vec<FileList>> {
             res
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            error!("Starting from scratch: {error} (not found)");
+            info!("Starting from scratch: {error} (not found)");
             vec![]
         }
         Err(e) => Err(e)?,
