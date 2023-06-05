@@ -8,46 +8,23 @@ use google_drive3::{
     DriveHub,
 };
 use serde::{Deserialize, Deserializer, Serialize};
+use log::{error, info};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    init_logger()?;
     let drive = init_drive().await?;
 
-    let mut list = {
-        match fs_err::File::open("ignore/file-list.json") {
-            Ok(file) => {
-                let res: Vec<FileList> = serde_json::from_reader(BufReader::new(file))?;
-                println!("Loaded {} pages", res.len());
-                res
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                println!("Starting from scratch: {error} (not found)");
-                vec![]
-            }
-            Err(e) => Err(e)?,
-        }
-    };
-    let save = |list: &[FileList]| {
-        (|| {
-            let path = "ignore/file-list.json";
-            let file = fs_err::File::create(path)?;
-            serde_json::to_writer(BufWriter::new(file), list)?;
-            println!("Saved list to {path:?}");
-            anyhow::Ok(())
-        })()
-        .context(
-            "Unfortunately, we failed to save data and the accumulated data was permanently losed.",
-        )
-    };
+    let mut list = restore_data()?;
     loop {
         let token = match list.last() {
             None => "",
             Some(last) => match &last.next_page_token {
-                None => break println!("Complete."),
+                None => break info!("Complete."),
                 Some(ref token) => token,
             },
         };
-        println!("Page {}", list.len());
+        info!("Page {}", list.len());
         let Ok(res) = drive
             .files()
             .list()
@@ -57,21 +34,21 @@ async fn main() -> anyhow::Result<()> {
             .page_token(token)
             .param("fields", "nextPageToken,files(id,mimeType,parents,name)")
             .doit()
-            .await else { break save(&list)? };
-        let Ok(res) = FileList::try_from(res.1) else { break save(&list)? };
+            .await else { break save_data(&list)? };
+        let Ok(res) = FileList::try_from(res.1) else { break save_data(&list)? };
         list.push(res);
         if list.len() % 10 == 0 {
-            save(&list)?;
+            save_data(&list)?;
         }
     }
-    save(&list)?;
+    save_data(&list)?;
     Ok(())
 }
 
 #[derive(Serialize, Deserialize)]
 struct FileList {
     files: Vec<File>,
-    #[serde(rename="nextPageToken")]
+    #[serde(rename = "nextPageToken")]
     next_page_token: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
@@ -99,6 +76,24 @@ impl TryFrom<google_drive3::api::FileList> for FileList {
     }
 }
 
+fn init_logger() -> anyhow::Result<()> {
+    use simplelog::*;
+    CombinedLogger::init(vec![
+        TermLogger::new(
+            LevelFilter::Info,
+            Config::default(),
+            TerminalMode::Mixed,
+            ColorChoice::Auto,
+        ),
+        WriteLogger::new(
+            LevelFilter::Info,
+            Config::default(),
+            fs_err::File::create("ignore/log.log").unwrap(),
+        ),
+    ])?;
+    Ok(())
+}
+
 async fn init_drive() -> anyhow::Result<DriveHub<HttpsConnector<HttpConnector>>> {
     let hyper = hyper::Client::builder().build(
         HttpsConnectorBuilder::new()
@@ -115,4 +110,31 @@ async fn init_drive() -> anyhow::Result<DriveHub<HttpsConnector<HttpConnector>>>
             .await?
     };
     Ok(DriveHub::new(hyper, auth))
+}
+
+fn restore_data() -> anyhow::Result<Vec<FileList>> {
+    Ok(match fs_err::File::open("ignore/file-list.json") {
+        Ok(file) => {
+            let res: Vec<FileList> = serde_json::from_reader(BufReader::new(file))?;
+            info!("Loaded {} pages", res.len());
+            res
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            error!("Starting from scratch: {error} (not found)");
+            vec![]
+        }
+        Err(e) => Err(e)?,
+    })
+}
+fn save_data(list: &[FileList]) -> anyhow::Result<()> {
+    (|| {
+        let path = "ignore/file-list.json";
+        let file = fs_err::File::create(path)?;
+        serde_json::to_writer(BufWriter::new(file), list)?;
+        info!("Saved list to {path:?}");
+        anyhow::Ok(())
+    })()
+    .context(
+        "Unfortunately, we failed to save data and the accumulated data was permanently losed.",
+    )
 }
