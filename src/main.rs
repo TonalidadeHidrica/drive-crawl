@@ -7,20 +7,25 @@ use google_drive3::{
     oauth2::{self, InstalledFlowAuthenticator, InstalledFlowReturnMethod},
     DriveHub,
 };
+use log::{error, info, warn};
 use serde::{Deserialize, Deserializer, Serialize};
-use log::{error, info};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init_logger()?;
     let drive = init_drive().await?;
+    let ctrlc_handler = init_ctrlc()?;
 
     let mut list = restore_data()?;
     loop {
         let token = match list.last() {
             None => "",
             Some(last) => match &last.next_page_token {
-                None => break info!("Complete."),
+                None => {
+                    save_data(&list)?;
+                    info!("Complete.");
+                    break;
+                }
                 Some(ref token) => token,
             },
         };
@@ -34,14 +39,24 @@ async fn main() -> anyhow::Result<()> {
             .page_token(token)
             .param("fields", "nextPageToken,files(id,mimeType,parents,name)")
             .doit()
-            .await else { break save_data(&list)? };
-        let Ok(res) = FileList::try_from(res.1) else { break save_data(&list)? };
+            .await else {
+            error!("Aborting due to an API error.");
+            break save_data(&list)?
+        };
+        let Ok(res) = FileList::try_from(res.1) else {
+            error!("Aborting due to a conversion error.");
+            break save_data(&list)?
+        };
         list.push(res);
+        if let Ok(()) = ctrlc_handler.try_recv() {
+            info!("Received ctrl-c.  Saving before terminating.");
+            save_data(&list)?;
+            break;
+        }
         if list.len() % 10 == 0 {
             save_data(&list)?;
         }
     }
-    save_data(&list)?;
     Ok(())
 }
 
@@ -92,6 +107,17 @@ fn init_logger() -> anyhow::Result<()> {
         ),
     ])?;
     Ok(())
+}
+
+fn init_ctrlc() -> anyhow::Result<std::sync::mpsc::Receiver<()>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    ctrlc::set_handler(move || {
+        warn!("Ctrl-C detected!");
+        if let Err(e) = sender.send(()) {
+            error!("Failed to send ctrl-c signal.  Main thread dead?  {e}");
+        }
+    })?;
+    Ok(receiver)
 }
 
 async fn init_drive() -> anyhow::Result<DriveHub<HttpsConnector<HttpConnector>>> {
