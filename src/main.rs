@@ -38,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
             .corpora("user") // "user" by default, but setting it explicitly
             .q("'me' in owners")
             .page_token(token)
-            .param("fields", "nextPageToken,files(id,mimeType,parents,name,size,quotaBytesUsed)")
+            .param("fields", "nextPageToken,files(id,mimeType,parents,name,size,quotaBytesUsed,sha256Checksum)")
             .doit()
             .await else {
             error!("Aborting due to an API error.");
@@ -81,6 +81,8 @@ struct File {
     quota_bytes_used: Option<u64>,
     #[serde_as(as = "Option<DisplayFromStr>")]
     size: Option<u64>,
+    #[serde(rename="sha256Checksum")]
+    sha256_checksum: Option<String>,
 }
 fn null_to_default<'de, D, T>(d: D) -> Result<T, D::Error>
 where
