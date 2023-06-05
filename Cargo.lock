@@ -153,6 +153,8 @@ dependencies = [
  "anyhow",
  "google-drive3",
  "hyper-rustls 0.24.0",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
