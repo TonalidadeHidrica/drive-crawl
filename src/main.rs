@@ -1,6 +1,7 @@
 use std::{
+    collections::HashSet,
     io::{BufReader, BufWriter},
-    sync::mpsc::{self, Receiver},
+    sync::mpsc,
 };
 
 use anyhow::Context;
@@ -24,6 +25,8 @@ async fn main() -> anyhow::Result<()> {
 
     if args.list {
         list_files(&drive, &ctrlc_handler).await?;
+    } else if args.show_overview {
+        show_overview()?;
     }
 
     Ok(())
@@ -33,6 +36,8 @@ async fn main() -> anyhow::Result<()> {
 struct Args {
     #[clap(long)]
     list: bool,
+    #[clap(long)]
+    show_overview: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -122,14 +127,14 @@ async fn init_drive() -> anyhow::Result<Drive> {
     Ok(DriveHub::new(hyper, auth))
 }
 
-fn restore_data() -> anyhow::Result<Vec<FileList>> {
+fn restore_data(allow_not_found: bool) -> anyhow::Result<Vec<FileList>> {
     Ok(match fs_err::File::open("ignore/file-list.json") {
         Ok(file) => {
             let res: Vec<FileList> = serde_json::from_reader(BufReader::new(file))?;
             info!("Loaded {} pages", res.len());
             res
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && allow_not_found => {
             info!("Starting from scratch: {error} (not found)");
             vec![]
         }
@@ -150,7 +155,7 @@ fn save_data(list: &[FileList]) -> anyhow::Result<()> {
 }
 
 async fn list_files(drive: &Drive, ctrlc_handler: &mpsc::Receiver<()>) -> anyhow::Result<()> {
-    let mut list = restore_data()?;
+    let mut list = restore_data(true)?;
     loop {
         let token = match list.last() {
             None => "",
@@ -191,5 +196,30 @@ async fn list_files(drive: &Drive, ctrlc_handler: &mpsc::Receiver<()>) -> anyhow
             save_data(&list)?;
         }
     }
+    Ok(())
+}
+
+fn show_overview() -> anyhow::Result<()> {
+    let list = restore_data(false)?;
+    let files: Vec<_> = list.into_iter().flat_map(|e| e.files).collect();
+    let sum: u64 = files.iter().filter_map(|f| f.quota_bytes_used).sum();
+    println!("{sum}");
+
+    let print_file =
+        |file: &File| println!("{:?} {:50} {}", file.parents, file.mime_type, file.name);
+
+    println!("=== Files without a parent (or with multiple parents) ===");
+    for file in files.iter().filter(|f| f.parents.len() != 1) {
+        print_file(file);
+    }
+
+    let ids: HashSet<&str> = files.iter().map(|f| &f.id as &str).collect();
+    println!("=== Files with parents not owned by me ===");
+    for file in files.iter().filter(|f| {
+        f.parents.iter().any(|id| !ids.contains(id as &str)) && f.quota_bytes_used.unwrap_or(0) > 1024
+    }) {
+        print_file(file);
+    }
+
     Ok(())
 }
