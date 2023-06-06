@@ -1,10 +1,10 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io::{BufReader, BufWriter},
     sync::mpsc,
 };
 
-use anyhow::Context;
+use anyhow::{bail, Context};
 use clap::Parser;
 use google_drive3::{
     hyper::{self, client::HttpConnector},
@@ -27,6 +27,8 @@ async fn main() -> anyhow::Result<()> {
         list_files(&drive, &ctrlc_handler).await?;
     } else if args.show_overview {
         show_overview()?;
+    } else if args.tree {
+        show_tree()?;
     }
 
     Ok(())
@@ -38,6 +40,8 @@ struct Args {
     list: bool,
     #[clap(long)]
     show_overview: bool,
+    #[clap(long)]
+    tree: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -47,7 +51,7 @@ struct FileList {
     next_page_token: Option<String>,
 }
 #[serde_as]
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct File {
     id: String,
     #[serde(rename = "mimeType")]
@@ -216,10 +220,82 @@ fn show_overview() -> anyhow::Result<()> {
     let ids: HashSet<&str> = files.iter().map(|f| &f.id as &str).collect();
     println!("=== Files with parents not owned by me ===");
     for file in files.iter().filter(|f| {
-        f.parents.iter().any(|id| !ids.contains(id as &str)) && f.quota_bytes_used.unwrap_or(0) > 1024
+        f.parents.iter().any(|id| !ids.contains(id as &str))
+            && f.quota_bytes_used.unwrap_or(0) > 1024
     }) {
         print_file(file);
     }
 
     Ok(())
+}
+
+fn show_tree() -> anyhow::Result<()> {
+    let list = restore_data(false)?;
+    let files: Vec<_> = list.into_iter().flat_map(|e| e.files).collect();
+
+    let id_to_file: HashMap<_, _> = files.iter().map(|file| (&file.id as &str, file)).collect();
+    let mut parent_id_to_children = HashMap::<_, Vec<_>>::new();
+    for file in &files {
+        match &file.parents[..] {
+            [] => {}
+            [parent] => parent_id_to_children
+                .entry(parent as &str)
+                .or_default()
+                .push(file),
+            _ => bail!("Multiple parents: {file:?}"),
+        }
+    }
+
+    enum Node<'a> {
+        File(&'a File),
+        Root { id: &'a str, name: String },
+    }
+    fn dfs(id_to_children: &HashMap<&str, Vec<&File>>, this: Node, depth: usize) -> u64 {
+        let mut size_sum = match this {
+            Node::File(&File {
+                quota_bytes_used: Some(bytes),
+                ..
+            }) => bytes,
+            _ => 0,
+        };
+        let (id, name) = match this {
+            Node::File(file) => (&file.id as &str, &file.name),
+            Node::Root { id, ref name } => (id, name),
+        };
+        for child in id_to_children.get(id).iter().flat_map(|&x| x) {
+            size_sum += dfs(id_to_children, Node::File(child), depth + 1);
+        }
+        if size_sum >= 50 * (1 << 20) {
+            println!("{}o {}  {name}", " ".repeat(depth), format_size(size_sum));
+        }
+        size_sum
+    }
+    files
+        .iter()
+        .flat_map(|f| &f.parents)
+        .filter_map(|id| match id_to_file.get(id as &str) {
+            None => Some(Node::Root {
+                id,
+                name: format!("Root ({id})"),
+            }),
+            Some(file) => (file.parents.is_empty()).then_some(Node::File(file)),
+        })
+        .for_each(|file| {
+            dfs(&parent_id_to_children, file, 0);
+        });
+
+    Ok(())
+}
+
+fn format_size(size: u64) -> String {
+    let prefix = ["", "Ki", "Mi", "Gi"];
+    prefix
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(i, prefix)| {
+            let base = 1 << (i * 10);
+            (size >= base).then(|| format!("{:.2} {prefix}B", size as f64 / base as f64))
+        })
+        .unwrap_or("0 B".into())
 }
