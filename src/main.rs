@@ -270,19 +270,25 @@ fn show_tree() -> anyhow::Result<()> {
         }
         size_sum
     }
-    files
+    let mut roots: Vec<_> = files
         .iter()
         .flat_map(|f| &f.parents)
         .filter_map(|id| match id_to_file.get(id as &str) {
-            None => Some(Node::Root {
+            None => Some((
                 id,
-                name: format!("Root ({id})"),
-            }),
-            Some(file) => (file.parents.is_empty()).then_some(Node::File(file)),
+                Node::Root {
+                    id,
+                    name: format!("Root ({id})"),
+                },
+            )),
+            Some(file) => (file.parents.is_empty()).then_some((id, Node::File(file))),
         })
-        .for_each(|file| {
-            dfs(&parent_id_to_children, file, 0);
-        });
+        .collect();
+    roots.sort_by_key(|x| x.0);
+    roots.dedup_by_key(|x| x.0);
+    for (_, file) in roots {
+        dfs(&parent_id_to_children, file, 0);
+    }
 
     Ok(())
 }
