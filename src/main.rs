@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     io::{BufReader, BufWriter},
     sync::mpsc,
 };
@@ -29,6 +29,8 @@ async fn main() -> anyhow::Result<()> {
         show_overview()?;
     } else if args.tree {
         show_tree()?;
+    } else if let Some(ref id) = args.check_duplicates {
+        check_duplicates(&id)?;
     }
 
     Ok(())
@@ -42,6 +44,8 @@ struct Args {
     show_overview: bool,
     #[clap(long)]
     tree: bool,
+    #[clap(long)]
+    check_duplicates: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -234,17 +238,7 @@ fn show_tree() -> anyhow::Result<()> {
     let files: Vec<_> = list.into_iter().flat_map(|e| e.files).collect();
 
     let id_to_file: HashMap<_, _> = files.iter().map(|file| (&file.id as &str, file)).collect();
-    let mut parent_id_to_children = HashMap::<_, Vec<_>>::new();
-    for file in &files {
-        match &file.parents[..] {
-            [] => {}
-            [parent] => parent_id_to_children
-                .entry(parent as &str)
-                .or_default()
-                .push(file),
-            _ => bail!("Multiple parents: {file:?}"),
-        }
-    }
+    let parent_id_to_children = get_parent_id_to_children(&files)?;
 
     enum Node<'a> {
         File(&'a File),
@@ -293,6 +287,21 @@ fn show_tree() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn get_parent_id_to_children(files: &[File]) -> anyhow::Result<HashMap<&str, Vec<&File>>> {
+    let mut parent_id_to_children = HashMap::<_, Vec<_>>::new();
+    for file in files {
+        match &file.parents[..] {
+            [] => {}
+            [parent] => parent_id_to_children
+                .entry(parent as &str)
+                .or_default()
+                .push(file),
+            _ => bail!("Multiple parents: {file:?}"),
+        }
+    }
+    Ok(parent_id_to_children)
+}
+
 fn format_size(size: u64) -> String {
     let prefix = ["", "Ki", "Mi", "Gi"];
     prefix
@@ -304,4 +313,63 @@ fn format_size(size: u64) -> String {
             (size >= base).then(|| format!("{:.2} {prefix}B", size as f64 / base as f64))
         })
         .unwrap_or("0 B".into())
+}
+
+fn check_duplicates(id: &str) -> anyhow::Result<()> {
+    let list = restore_data(false)?;
+    let files: Vec<_> = list.into_iter().flat_map(|e| e.files).collect();
+    let id_to_file: HashMap<_, _> = files.iter().map(|file| (&file.id as &str, file)).collect();
+    let parent_id_to_children = get_parent_id_to_children(&files)?;
+
+    let Some(root) = id_to_file.get(id) else {
+        bail!("File with id {id:?} was not found");
+    };
+    let parent = root
+        .parents
+        .get(0)
+        .context("Specified root does not have a parent")?;
+    let parent = id_to_file
+        .get(parent as &str)
+        .with_context(|| format!("File with id={parent:?} was not found"))?;
+    let mut sha_to_files = HashMap::<_, Vec<_>>::new();
+    for file in bfs_children(&parent_id_to_children, parent) {
+        if let Some(ref sha256) = file.sha256_checksum {
+            sha_to_files.entry(&sha256[..]).or_default().push(file);
+        }
+    }
+    for file in bfs_children(&parent_id_to_children, root) {
+        if file.mime_type != "application/vnd.google-apps.folder" {
+            let sha256 = file
+                .sha256_checksum
+                .as_ref()
+                .with_context(|| format!("File with id={parent:?} does not have SHA256"))?;
+            let candidates = sha_to_files.get(&sha256[..]).map_or(&[][..], |x| x);
+            // if let Some(backup) = candidates.iter().find(|f| f.id != file.id) {
+            //     println!("{file:?}\n\t{backup:?}\n");
+            // }
+            if !candidates.iter().any(|f| f.id != file.id) {
+                println!("This file does not have a backup: {file:?}");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn bfs_children<'a>(
+    parent_id_to_children: &HashMap<&str, Vec<&'a File>>,
+    root: &'a File,
+) -> VecDeque<&'a File> {
+    let mut que = VecDeque::new();
+    que.push_back(root);
+    for i in 0.. {
+        let Some(file) = que.get(i) else { break };
+        for child in parent_id_to_children
+            .get(&file.id as &str)
+            .map_or(&[][..], |x| x)
+        {
+            que.push_back(child);
+        }
+    }
+    que
 }
